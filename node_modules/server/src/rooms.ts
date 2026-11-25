@@ -1,3 +1,4 @@
+import { performance } from 'node:perf_hooks';
 import { EventEmitter, on } from 'node:events';
 import { Readable } from 'node:stream';
 import { pipeline } from 'node:stream/promises';
@@ -27,6 +28,7 @@ import {
 import { config } from './config.js';
 import { JsonLinesTransform } from './log/matchlog.js';
 import { netSim } from './netSim.js';
+import { createBotPilot, type BotPilot } from './bots.js';
 
 export type RoomLogEvent =
   | { readonly t: number; readonly type: 'join'; readonly name: string; readonly playerId: EntityId }
@@ -48,15 +50,18 @@ interface ConnectedPlayer {
 }
 
 const TICK_INTERVAL_MS = 1000 / config.TICK_RATE;
+const MAX_TICK_SAMPLES = 300;
 
 export class Room extends EventEmitter<RoomEvents> {
   readonly id: string;
   private readonly players = new Map<WebSocket, ConnectedPlayer>();
   private readonly pendingInputs = new Map<EntityId, InputMessage[]>();
+  private readonly bots: BotPilot[] = [];
   world: WorldState;
 
   private lastTickDurationMs = 0;
   private maxTickDurationMs = 0;
+  private readonly tickSamples: number[] = [];
   private nextTickTarget = performance.now() + TICK_INTERVAL_MS;
   private loopTimer: NodeJS.Timeout | null = null;
 
@@ -75,9 +80,19 @@ export class Room extends EventEmitter<RoomEvents> {
       const t0 = performance.now();
 
       const inputsForStep = new Map<EntityId, readonly InputMessage[]>();
+
+      // 1. Збираємо інпути живих гравців
       for (const [playerId, list] of this.pendingInputs.entries()) {
         if (list.length > 0) {
           inputsForStep.set(playerId, list.splice(0, list.length));
+        }
+      }
+
+      // 2. Збираємо інпути серверних ботів (той самий інтерфейс InputMessage)
+      for (let i = 0; i < this.bots.length; i++) {
+        const bot = this.bots[i];
+        if (bot !== undefined) {
+          inputsForStep.set(bot.id, [bot.decide(this.world)]);
         }
       }
 
@@ -87,6 +102,11 @@ export class Room extends EventEmitter<RoomEvents> {
       this.lastTickDurationMs = t1 - t0;
       if (this.lastTickDurationMs > this.maxTickDurationMs) {
         this.maxTickDurationMs = this.lastTickDurationMs;
+      }
+
+      this.tickSamples.push(this.lastTickDurationMs);
+      if (this.tickSamples.length > MAX_TICK_SAMPLES) {
+        this.tickSamples.shift();
       }
 
       this.broadcastSnapshot();
@@ -104,6 +124,21 @@ export class Room extends EventEmitter<RoomEvents> {
       clearTimeout(this.loopTimer);
       this.loopTimer = null;
     }
+  }
+
+  spawnBots(count: number): void {
+    const newShips = [...this.world.ships];
+    for (let i = 0; i < count; i++) {
+      const bot = createBotPilot(this.bots.length);
+      this.bots.push(bot);
+      const spawnX = 200 + ((this.bots.length * 170) % 1200);
+      const spawnY = 200 + ((this.bots.length * 130) % 500);
+      newShips.push(createShip(bot.id, bot.name, spawnX, spawnY, 0));
+    }
+    this.world = {
+      ...this.world,
+      ships: newShips,
+    };
   }
 
   private broadcastSnapshot(): void {
@@ -180,7 +215,10 @@ export class Room extends EventEmitter<RoomEvents> {
       };
     }
 
-    const roster = Array.from(this.players.values()).map((p) => p.name);
+    const roster = [
+      ...Array.from(this.players.values()).map((p) => p.name),
+      ...this.bots.map((b) => b.name),
+    ];
     this.broadcast({ type: 'roster', players: roster });
     this.emit('join', { name, playerId });
     this.emit('log', { t: Date.now(), type: 'join', name, playerId });
@@ -194,12 +232,15 @@ export class Room extends EventEmitter<RoomEvents> {
       ships: this.world.ships.filter((s) => s.id !== playerId),
     };
 
-    const roster = Array.from(this.players.values()).map((p) => p.name);
+    const roster = [
+      ...Array.from(this.players.values()).map((p) => p.name),
+      ...this.bots.map((b) => b.name),
+    ];
     this.broadcast({ type: 'roster', players: roster });
     this.emit('leave', { name, playerId });
     this.emit('log', { t: Date.now(), type: 'leave', name, playerId });
 
-    if (this.players.size === 0) {
+    if (this.players.size === 0 && this.bots.length === 0) {
       this.stopLoop();
       this.emit('empty');
     }
@@ -222,12 +263,21 @@ export class Room extends EventEmitter<RoomEvents> {
     }
   }
 
+  private getTickP99(): number {
+    if (this.tickSamples.length === 0) return 0;
+    const sorted = [...this.tickSamples].sort((a, b) => a - b);
+    const idx = Math.min(sorted.length - 1, Math.floor(sorted.length * 0.99));
+    return sorted[idx] ?? 0;
+  }
+
   getStats() {
     return {
       roomId: this.id,
       tick: this.world.tick,
       players: this.players.size,
+      bots: this.bots.length,
       lastTickDurationMs: Number(this.lastTickDurationMs.toFixed(3)),
+      p99TickDurationMs: Number(this.getTickP99().toFixed(3)),
       maxTickDurationMs: Number(this.maxTickDurationMs.toFixed(3)),
     };
   }
@@ -250,7 +300,12 @@ export class RoomManager {
   }
 
   getStats() {
+    const mem = process.memoryUsage();
+    const elu = performance.eventLoopUtilization();
     return {
+      rssMB: Number((mem.rss / 1024 / 1024).toFixed(2)),
+      heapUsedMB: Number((mem.heapUsed / 1024 / 1024).toFixed(2)),
+      elu: Number(elu.utilization.toFixed(3)),
       netSim: netSim.getConfig(),
       rooms: Array.from(this.rooms.values()).map((r) => r.getStats()),
     };

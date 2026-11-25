@@ -1,6 +1,7 @@
 {
   "name": "cosmic-dogfight-workspace",
   "private": true,
+  "type": "module",
   "workspaces": [
     "client",
     "server",
@@ -8,6 +9,23 @@
   ],
   "scripts": {
     "typecheck": "npm run typecheck --workspace=shared && npm run typecheck --workspace=server && npm run typecheck --workspace=client",
-    "test": "node --import tsx --test server/test/lab06.test.ts"
+    "lint": "eslint shared/src server/src client/src",
+    "test": "vitest run --coverage",
+    "build": "npm run build --workspace=client",
+    "test:e2e": "playwright test",
+    "loadtest": "node --import tsx server/src/loadtest.ts"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@playwright/test": "^1.65.1",
+    "@types/node": "^26.6.10",
+    "@types/ws": "^8.18.2",
+    "@vitest/coverage-v8": "^2.1.8",
+    "eslint": "^10.15.0",
+    "fast-check": "^4.11.0",
+    "tsx": "^4.23.15",
+    "typescript": "^6.0.3",
+    "typescript-eslint": "^8.74.0",
+    "vitest": "^2.1.8"
   }
 }

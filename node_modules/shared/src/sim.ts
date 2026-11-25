@@ -5,10 +5,12 @@ import {
   type BulletEntity,
   type EntityId,
   type PlayerInput,
+  type Seq,
   type ShipEntity,
   type Vector2,
   type WorldState,
 } from './types.js';
+import { SpatialHash, type SpatialBody } from './spatialHash.js';
 
 export const FIXED_DT = 1 / 30;
 export const WORLD_WIDTH = 1600;
@@ -16,8 +18,10 @@ export const WORLD_HEIGHT = 900;
 export const SHIP_ACCEL = 420;
 export const SHIP_TURN_SPEED = 4.2;
 export const SHIP_DRAG = 0.985;
+export const SHIP_RADIUS = 16;
 export const BULLET_SPEED = 780;
 export const BULLET_TTL = 1.2;
+export const BULLET_RADIUS = 4;
 export const FIRE_COOLDOWN = 0.22;
 
 export function createRng(seed = 1337): () => number {
@@ -35,6 +39,18 @@ export function vec2(x: number, y: number): Vector2 {
   return { x, y };
 }
 
+export function vecAdd(a: Vector2, b: Vector2): Vector2 {
+  return { x: a.x + b.x, y: a.y + b.y };
+}
+
+export function vecScale(v: Vector2, s: number): Vector2 {
+  return { x: v.x * s, y: v.y * s };
+}
+
+export function vecLen(v: Vector2): number {
+  return Math.hypot(v.x, v.y);
+}
+
 export function wrapCoord(val: number, max: number): number {
   return ((val % max) + max) % max;
 }
@@ -44,6 +60,20 @@ export function normalizeAngle(angle: number): number {
   while (a > Math.PI) a -= Math.PI * 2;
   while (a < -Math.PI) a += Math.PI * 2;
   return a;
+}
+
+export function checkCircleCollision(
+  ax: number,
+  ay: number,
+  ar: number,
+  bx: number,
+  by: number,
+  br: number
+): boolean {
+  const dx = ax - bx;
+  const dy = ay - by;
+  const rSum = ar + br;
+  return dx * dx + dy * dy <= rSum * rSum;
 }
 
 export function createShip(
@@ -124,6 +154,33 @@ export function integrateShip(
   };
 }
 
+/**
+ * Чиста функція звірки стану клієнта зі знімком сервера (Server Reconciliation)
+ */
+export function reconcileShip<T extends PlayerInput>(
+  serverShip: ShipEntity,
+  pendingInputs: readonly T[],
+  lastProcessedSeq: Seq,
+  dt = FIXED_DT
+): { readonly ship: ShipEntity; readonly remainingInputs: readonly T[] } {
+  const remainingInputs = pendingInputs.filter((inp) => inp.seq > lastProcessedSeq);
+  let reconciled = serverShip;
+  for (let i = 0; i < remainingInputs.length; i++) {
+    const inp = remainingInputs[i];
+    if (inp !== undefined) {
+      reconciled = integrateShip(reconciled, inp, dt);
+    }
+  }
+  return { ship: reconciled, remainingInputs };
+}
+
+interface ShipCollider extends SpatialBody {
+  readonly shipIndex: number;
+}
+
+const sharedSpatialHash = new SpatialHash<ShipCollider>(120);
+const nearbyScratch: ShipCollider[] = [];
+
 export function stepWorld(
   state: WorldState,
   inputsMap: ReadonlyMap<EntityId, readonly PlayerInput[]> = new Map(),
@@ -162,22 +219,70 @@ export function stepWorld(
     return ship;
   });
 
-  const bullets = [...state.bullets, ...spawnedBullets]
-    .map((b): BulletEntity => ({
-      ...b,
-      pos: vec2(
-        wrapCoord(b.pos.x + b.vel.x * dt, WORLD_WIDTH),
-        wrapCoord(b.pos.y + b.vel.y * dt, WORLD_HEIGHT)
-      ),
-      ttl: b.ttl - dt,
-    }))
-    .filter((b) => b.ttl > 0);
+  // Індексуємо кораблі у SpatialHash для швидкого пошуку колізій O(n)
+  sharedSpatialHash.clear();
+  for (let i = 0; i < ships.length; i++) {
+    const s = ships[i];
+    if (s !== undefined) {
+      sharedSpatialHash.insert({
+        id: s.id,
+        x: s.pos.x,
+        y: s.pos.y,
+        radius: SHIP_RADIUS,
+        shipIndex: i,
+      });
+    }
+  }
+
+  const hpDamage = new Map<EntityId, number>();
+  const survivingBullets: BulletEntity[] = [];
+  const allBullets = [...state.bullets, ...spawnedBullets];
+
+  for (let i = 0; i < allBullets.length; i++) {
+    const b = allBullets[i];
+    if (b === undefined) continue;
+
+    const nx = wrapCoord(b.pos.x + b.vel.x * dt, WORLD_WIDTH);
+    const ny = wrapCoord(b.pos.y + b.vel.y * dt, WORLD_HEIGHT);
+    const nttl = b.ttl - dt;
+    if (nttl <= 0) continue;
+
+    let hit = false;
+    const candidates = sharedSpatialHash.queryNear(nx, ny, BULLET_RADIUS + SHIP_RADIUS, nearbyScratch);
+    for (let j = 0; j < candidates.length; j++) {
+      const target = candidates[j];
+      if (target === undefined || target.id === b.ownerId) continue;
+      if (checkCircleCollision(nx, ny, BULLET_RADIUS, target.x, target.y, target.radius)) {
+        hit = true;
+        hpDamage.set(asEntityId(target.id), (hpDamage.get(asEntityId(target.id)) ?? 0) + 10);
+        break;
+      }
+    }
+
+    if (!hit) {
+      survivingBullets.push({
+        ...b,
+        pos: vec2(nx, ny),
+        ttl: nttl,
+      });
+    }
+  }
+
+  const updatedShips =
+    hpDamage.size === 0
+      ? ships
+      : ships.map((s) => {
+          const dmg = hpDamage.get(s.id);
+          if (dmg === undefined) return s;
+          const nextHp = s.hp - dmg;
+          return nextHp > 0 ? { ...s, hp: nextHp } : { ...s, hp: 100 };
+        });
 
   return {
     ...state,
     tick: nextTick,
     nextBulletId,
-    ships,
-    bullets,
+    ships: updatedShips,
+    bullets: survivingBullets,
   };
 }

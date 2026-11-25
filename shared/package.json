@@ -6,7 +6,9 @@
     "./types": "./src/types.ts",
     "./sim": "./src/sim.ts",
     "./protocol": "./src/protocol.ts",
-    "./codec": "./src/codec.ts"
+    "./codec": "./src/codec.ts",
+    "./pool": "./src/pool.ts",
+    "./spatialHash": "./src/spatialHash.ts"
   },
   "scripts": {
     "typecheck": "tsc --noEmit -p tsconfig.json"

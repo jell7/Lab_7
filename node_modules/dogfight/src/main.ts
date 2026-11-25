@@ -6,9 +6,11 @@ import {
   BULLET_SPEED,
   FIRE_COOLDOWN,
   integrateShip,
+  reconcileShip,
   wrapCoord,
   normalizeAngle,
 } from 'shared/sim';
+import { ObjectPool } from 'shared/pool';
 import {
   asSeq,
   asTick,
@@ -55,6 +57,7 @@ window.addEventListener('keyup', (e) => keys.delete(e.code));
 
 let myId: EntityId | null = null;
 let myName = 'Pilot_' + Math.floor(100 + Math.random() * 900);
+let currentRoom = 'Alpha Sector';
 let inGame = false;
 let clientTickNum = 0;
 let nextSeqNum = 1;
@@ -65,17 +68,43 @@ let renderOffsetX = 0;
 let renderOffsetY = 0;
 let lastCorrectionMag = 0;
 
-interface LocalBullet {
-  readonly x: number;
-  readonly y: number;
-  readonly vx: number;
-  readonly vy: number;
-  readonly ttl: number;
+// Пул об'єктів для локально передбачених куль (нуль алокацій у гарячому циклі)
+interface MutableBullet {
+  x: number;
+  y: number;
+  vx: number;
+  vy: number;
+  ttl: number;
 }
 
-let localBullets: LocalBullet[] = [];
+const bulletPool = new ObjectPool<MutableBullet>(
+  128,
+  () => ({ x: 0, y: 0, vx: 0, vy: 0, ttl: 0 }),
+  (b) => {
+    b.x = 0;
+    b.y = 0;
+    b.vx = 0;
+    b.vy = 0;
+    b.ttl = 0;
+  }
+);
+const activeBullets: MutableBullet[] = [];
 let localFireCooldown = 0;
 let thrustSoundCooldown = 0;
+
+// Web Worker для фізики частинок вибухів/пострілів у фоновому потоці
+const particleWorker = new Worker(new URL('./particleWorker.ts', import.meta.url), {
+  type: 'module',
+});
+let particleCoords = new Float32Array(0);
+let particleCount = 0;
+
+particleWorker.onmessage = (
+  event: MessageEvent<{ readonly buffer: ArrayBuffer; readonly count: number }>
+) => {
+  particleCoords = new Float32Array(event.data.buffer);
+  particleCount = event.data.count;
+};
 
 interface TimedSnapshot {
   readonly recvTime: number;
@@ -95,6 +124,13 @@ const netGraph = new NetGraph({
       body: JSON.stringify(cfg),
     });
   },
+  onSpawnBots: (count) => {
+    void fetch(`/api/rooms/${encodeURIComponent(currentRoom)}/bots`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ count }),
+    });
+  },
 });
 
 const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -104,8 +140,9 @@ const connection = new GameConnection(wsUrl, bus, {
   onBytesOut: (b) => netGraph.recordOut(b),
 });
 
-bus.on('welcome', ({ playerId }) => {
+bus.on('welcome', ({ playerId, room }) => {
   myId = playerId;
+  currentRoom = room;
 });
 
 bus.on('rtt', ({ rttMs }) => {
@@ -127,6 +164,8 @@ setInterval(() => {
 }, 1000);
 
 bus.on('snapshot', (snap) => {
+  performance.mark('reconcile:start');
+
   const now = performance.now();
   lastSnapshotRecvTime = now;
   myId = snap.yourId;
@@ -137,25 +176,31 @@ bus.on('snapshot', (snap) => {
   }
 
   const serverSelf = snap.state.ships.find((s) => s.id === myId);
-  if (!serverSelf) return;
-
-  pendingInputs = pendingInputs.filter((inp) => inp.seq > snap.lastProcessedSeq);
+  if (!serverSelf) {
+    performance.measure('reconcile', 'reconcile:start');
+    performance.clearMarks('reconcile:start');
+    performance.clearMeasures('reconcile');
+    return;
+  }
 
   if (!netGraph.predictionEnabled || !predictedShip) {
+    pendingInputs = pendingInputs.filter((inp) => inp.seq > snap.lastProcessedSeq);
     predictedShip = serverSelf;
     renderOffsetX = 0;
     renderOffsetY = 0;
     lastCorrectionMag = 0;
+    performance.measure('reconcile', 'reconcile:start');
+    performance.clearMarks('reconcile:start');
+    performance.clearMeasures('reconcile');
     return;
   }
 
   const prevX = predictedShip.pos.x;
   const prevY = predictedShip.pos.y;
 
-  let reconciled: ShipEntity = serverSelf;
-  for (const inp of pendingInputs) {
-    reconciled = integrateShip(reconciled, inp, FIXED_DT);
-  }
+  const result = reconcileShip(serverSelf, pendingInputs, snap.lastProcessedSeq, FIXED_DT);
+  pendingInputs = [...result.remainingInputs];
+  const reconciled = result.ship;
 
   let dx = prevX - reconciled.pos.x;
   let dy = prevY - reconciled.pos.y;
@@ -168,6 +213,10 @@ bus.on('snapshot', (snap) => {
   renderOffsetX += dx;
   renderOffsetY += dy;
   predictedShip = reconciled;
+
+  performance.measure('reconcile', 'reconcile:start');
+  performance.clearMarks('reconcile:start');
+  performance.clearMeasures('reconcile');
 });
 
 async function openLobby(): Promise<void> {
@@ -188,13 +237,13 @@ async function openLobby(): Promise<void> {
       rooms = parsed.data;
     }
   } catch {
-    // Використовуємо стандартну кімнату
+    // Стандартна кімната
   }
 
   const optionsHtml = rooms.map((r) => `<option value="${r.id}">${r.name}</option>`).join('');
 
   overlay.innerHTML = `
-    <h2 style="margin:0;color:#38b6ff">COSMIC DOGFIGHT (TypeScript Strict)</h2>
+    <h2 style="margin:0;color:#38b6ff">COSMIC DOGFIGHT (Lab 07 — V8 & Pool)</h2>
     <div><label>Нікнейм: <input id="lb-name" value="${myName}" style="padding:4px 8px" /></label></div>
     <div><label>Кімната: <select id="lb-room" style="padding:4px 8px">${optionsHtml}</select></label></div>
     <div style="display:flex;gap:6px">
@@ -232,11 +281,11 @@ async function openLobby(): Promise<void> {
   const nameInput = overlay.querySelector<HTMLInputElement>('#lb-name');
   joinBtn?.addEventListener('click', () => {
     myName = nameInput?.value.trim() || myName;
-    const chosenRoom = selectEl?.value || 'Alpha Sector';
+    currentRoom = selectEl?.value || 'Alpha Sector';
     inGame = true;
     connection.send({
       type: 'join',
-      room: chosenRoom,
+      room: currentRoom,
       name: myName,
       codec: netGraph.binaryEnabled ? 'binary' : 'json',
     });
@@ -285,13 +334,20 @@ setInterval(() => {
     sound.playLaser();
 
     if (netGraph.predictionEnabled && predictedShip) {
-      localBullets.push({
-        x: wrapCoord(predictedShip.pos.x + Math.cos(predictedShip.angle) * 20, WORLD_WIDTH),
-        y: wrapCoord(predictedShip.pos.y + Math.sin(predictedShip.angle) * 20, WORLD_HEIGHT),
-        vx: predictedShip.vel.x + Math.cos(predictedShip.angle) * BULLET_SPEED,
-        vy: predictedShip.vel.y + Math.sin(predictedShip.angle) * BULLET_SPEED,
-        ttl: 0.25,
-      });
+      const muzzleX = wrapCoord(predictedShip.pos.x + Math.cos(predictedShip.angle) * 20, WORLD_WIDTH);
+      const muzzleY = wrapCoord(predictedShip.pos.y + Math.sin(predictedShip.angle) * 20, WORLD_HEIGHT);
+
+      // Беремо кулю з пулу замість new
+      const bullet = bulletPool.acquire();
+      bullet.x = muzzleX;
+      bullet.y = muzzleY;
+      bullet.vx = predictedShip.vel.x + Math.cos(predictedShip.angle) * BULLET_SPEED;
+      bullet.vy = predictedShip.vel.y + Math.sin(predictedShip.angle) * BULLET_SPEED;
+      bullet.ttl = 0.25;
+      activeBullets.push(bullet);
+
+      // Надсилаємо команду спавну частинок у Web Worker
+      particleWorker.postMessage({ type: 'spawn', x: muzzleX, y: muzzleY, count: 12 });
     }
   }
 
@@ -300,14 +356,22 @@ setInterval(() => {
     predictedShip = integrateShip(predictedShip, inputPacket, FIXED_DT);
   }
 
-  localBullets = localBullets
-    .map((b) => ({
-      ...b,
-      x: wrapCoord(b.x + b.vx * FIXED_DT, WORLD_WIDTH),
-      y: wrapCoord(b.y + b.vy * FIXED_DT, WORLD_HEIGHT),
-      ttl: b.ttl - FIXED_DT,
-    }))
-    .filter((b) => b.ttl > 0);
+  // Оновлення позицій куль на місці (in-place) без створення нових масивів чи об'єктів
+  for (let i = activeBullets.length - 1; i >= 0; i--) {
+    const b = activeBullets[i];
+    if (!b) continue;
+    b.x = wrapCoord(b.x + b.vx * FIXED_DT, WORLD_WIDTH);
+    b.y = wrapCoord(b.y + b.vy * FIXED_DT, WORLD_HEIGHT);
+    b.ttl -= FIXED_DT;
+
+    if (b.ttl <= 0) {
+      const last = activeBullets.pop();
+      if (last !== undefined && i < activeBullets.length) {
+        activeBullets[i] = last;
+      }
+      bulletPool.release(b);
+    }
+  }
 }, 1000 / 30);
 
 function lerpAngle(a: number, b: number, t: number): number {
@@ -322,19 +386,28 @@ function lerpWrap(a: number, b: number, t: number, max: number): number {
   return wrapCoord(a + d * t, max);
 }
 
+const interpShipsScratch: ShipEntity[] = [];
+const interpBulletsScratch: BulletEntity[] = [];
+
 function getInterpolatedRemoteEntities(now: number): {
   ships: readonly ShipEntity[];
   bullets: readonly BulletEntity[];
 } {
+  interpShipsScratch.length = 0;
+  interpBulletsScratch.length = 0;
+
   const first = snapshotBuffer[0];
-  if (!first) return { ships: [], bullets: [] };
+  if (!first) return { ships: interpShipsScratch, bullets: interpBulletsScratch };
   const renderTime = now - netGraph.interpDelayMs;
 
   if (snapshotBuffer.length === 1 || renderTime <= first.recvTime) {
-    return {
-      ships: first.state.ships.filter((sh) => sh.id !== myId),
-      bullets: first.state.bullets,
-    };
+    for (const sh of first.state.ships) {
+      if (sh.id !== myId) interpShipsScratch.push(sh);
+    }
+    for (const b of first.state.bullets) {
+      interpBulletsScratch.push(b);
+    }
+    return { ships: interpShipsScratch, bullets: interpBulletsScratch };
   }
 
   let i = snapshotBuffer.length - 2;
@@ -349,14 +422,13 @@ function getInterpolatedRemoteEntities(now: number): {
   const span = Math.max(1, s1.recvTime - s0.recvTime);
   const t = Math.max(0, Math.min(1, (renderTime - s0.recvTime) / span));
 
-  const ships: ShipEntity[] = [];
   for (const bShip of s1.state.ships) {
     if (bShip.id === myId) continue;
     const aShip = s0.state.ships.find((s) => s.id === bShip.id);
     if (!aShip) {
-      ships.push(bShip);
+      interpShipsScratch.push(bShip);
     } else {
-      ships.push({
+      interpShipsScratch.push({
         ...bShip,
         pos: {
           x: lerpWrap(aShip.pos.x, bShip.pos.x, t, WORLD_WIDTH),
@@ -367,19 +439,22 @@ function getInterpolatedRemoteEntities(now: number): {
     }
   }
 
-  const bullets: BulletEntity[] = s1.state.bullets.map((bBul) => {
+  for (const bBul of s1.state.bullets) {
     const aBul = s0.state.bullets.find((b) => b.id === bBul.id);
-    if (!aBul) return bBul;
-    return {
-      ...bBul,
-      pos: {
-        x: lerpWrap(aBul.pos.x, bBul.pos.x, t, WORLD_WIDTH),
-        y: lerpWrap(aBul.pos.y, bBul.pos.y, t, WORLD_HEIGHT),
-      },
-    };
-  });
+    if (!aBul) {
+      interpBulletsScratch.push(bBul);
+    } else {
+      interpBulletsScratch.push({
+        ...bBul,
+        pos: {
+          x: lerpWrap(aBul.pos.x, bBul.pos.x, t, WORLD_WIDTH),
+          y: lerpWrap(aBul.pos.y, bBul.pos.y, t, WORLD_HEIGHT),
+        },
+      });
+    }
+  }
 
-  return { ships, bullets };
+  return { ships: interpShipsScratch, bullets: interpBulletsScratch };
 }
 
 function drawShip(x: number, y: number, angle: number, color: string, label: string): void {
@@ -412,8 +487,14 @@ function drawShip(x: number, y: number, angle: number, color: string, label: str
 let lastFrameTime = performance.now();
 
 function render(now: number): void {
-  const frameDt = (now - lastFrameTime) / 1000;
+  const frameStart = performance.now();
+  performance.mark('render:start');
+
+  const frameDt = Math.min(0.1, (now - lastFrameTime) / 1000);
   lastFrameTime = now;
+
+  // Крок симуляції частинок у Web Worker
+  particleWorker.postMessage({ type: 'step', dt: frameDt });
 
   const decay = Math.exp(-frameDt / 0.1);
   renderOffsetX *= decay;
@@ -441,30 +522,56 @@ function render(now: number): void {
   const scaleX = canvas.width / WORLD_WIDTH;
   const scaleY = canvas.height / WORLD_HEIGHT;
 
+  // Малюємо частинки з Web Worker (Float32Array [x, y, alpha])
+  for (let i = 0; i < particleCount; i++) {
+    const base = i * 3;
+    const px = particleCoords[base] ?? 0;
+    const py = particleCoords[base + 1] ?? 0;
+    const alpha = particleCoords[base + 2] ?? 0;
+    ctx.fillStyle = `rgba(255, 180, 80, ${alpha.toFixed(2)})`;
+    ctx.fillRect(px * scaleX, py * scaleY, 2.5, 2.5);
+  }
+
+  // Малюємо серверні кулі
   ctx.fillStyle = '#ffd166';
-  for (const b of remote.bullets) {
+  for (let i = 0; i < remote.bullets.length; i++) {
+    const b = remote.bullets[i];
+    if (!b) continue;
     ctx.beginPath();
     ctx.arc(b.pos.x * scaleX, b.pos.y * scaleY, 3.5, 0, Math.PI * 2);
     ctx.fill();
   }
 
+  // Малюємо локальні кулі з пулу
   ctx.fillStyle = '#72efdd';
-  for (const b of localBullets) {
+  for (let i = 0; i < activeBullets.length; i++) {
+    const b = activeBullets[i];
+    if (!b) continue;
     ctx.beginPath();
     ctx.arc(b.x * scaleX, b.y * scaleY, 3, 0, Math.PI * 2);
     ctx.fill();
   }
 
-  for (const s of remote.ships) {
+  // Малюємо чужі кораблі та ботів
+  for (let i = 0; i < remote.ships.length; i++) {
+    const s = remote.ships[i];
+    if (!s) continue;
     drawShip(s.pos.x, s.pos.y, s.angle, '#ff5964', s.name);
   }
 
+  // Малюємо свій корабель
   if (predictedShip) {
     const vx = wrapCoord(predictedShip.pos.x + renderOffsetX, WORLD_WIDTH);
     const vy = wrapCoord(predictedShip.pos.y + renderOffsetY, WORLD_HEIGHT);
     drawShip(vx, vy, predictedShip.angle, '#38b6ff', `${myName} (YOU)`);
   }
 
+  performance.measure('render', 'render:start');
+  performance.clearMarks('render:start');
+  performance.clearMeasures('render');
+
+  const frameDurationMs = performance.now() - frameStart;
+  netGraph.recordFrameTime(frameDurationMs);
   netGraph.update({
     rttMs: currentRtt,
     snapshotAgeMs: now - lastSnapshotRecvTime,

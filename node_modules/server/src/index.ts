@@ -12,6 +12,10 @@ const CreateRoomSchema = z.object({
   id: z.string().min(1).max(40).optional(),
 });
 
+const SpawnBotsSchema = z.object({
+  count: z.number().int().min(1).max(32).default(8),
+});
+
 const CLIENT_DIST = path.resolve(process.cwd(), '../client/dist');
 
 const MIME_TYPES: Record<string, string> = {
@@ -61,6 +65,36 @@ const server = http.createServer((req, res) => {
         roomManager.createRoom(roomId);
         res.writeHead(201, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ id: roomId }));
+      } catch {
+        res.writeHead(400, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      }
+    });
+    return;
+  }
+
+  // Спавн N серверних ботів у вказану кімнату
+  const botMatch = /^\/api\/rooms\/([^/]+)\/bots$/.exec(url);
+  if (method === 'POST' && botMatch !== null) {
+    const roomId = decodeURIComponent(botMatch[1] ?? 'Alpha Sector');
+    let body = '';
+    req.on('data', (chunk: Buffer) => {
+      body += chunk.toString('utf8');
+      if (body.length > 4096) req.destroy();
+    });
+    req.on('end', () => {
+      try {
+        const raw: unknown = body.length > 0 ? JSON.parse(body) : {};
+        const parsed = SpawnBotsSchema.safeParse(raw);
+        if (!parsed.success) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'Invalid bots payload' }));
+          return;
+        }
+        const room = roomManager.rooms.get(roomId) ?? roomManager.createRoom(roomId);
+        room.spawnBots(parsed.data.count);
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ roomId, added: parsed.data.count }));
       } catch {
         res.writeHead(400, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'Invalid JSON' }));
@@ -125,7 +159,6 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Статичні файли клієнта (для роботи на Render / GitHub Codespaces без окремого Vite)
   if (method === 'GET' && fs.existsSync(CLIENT_DIST)) {
     const cleanUrl = url.split('?')[0] ?? '/';
     const candidate = path.join(CLIENT_DIST, cleanUrl === '/' ? 'index.html' : cleanUrl);
